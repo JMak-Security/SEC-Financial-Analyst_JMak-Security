@@ -1,0 +1,54 @@
+{
+  "description": "Small inputs and expected outcomes for offline ratio edge-case checks.",
+  "cases": [
+    {
+      "name": "zero_denominators_and_negative_cash_flow",
+      "balance_sheet": {
+        "current_assets": 10.0,
+        "current_liabilities": 0.0,
+        "total_assets": 0.0,
+        "total_liabilities": 5.0,
+        "shareholders_equity": 0.0
+      },
+      "income_statement": {
+        "revenue": 0.0,
+        "net_income": -2.0
+      },
+      "cash_flow_statement": {
+        "operating_cash_flow": -3.0,
+        "capital_expenditures": -1.0
+      },
+      "expected": {
+        "current_ratio": null,
+        "liabilities_to_assets": null,
+        "net_margin": null,
+        "free_cash_flow": -4.0
+      }
+    },
+    {
+      "name": "missing_inventory_prevents_quick_ratio",
+      "balance_sheet": {
+        "current_assets": 100.0,
+        "current_liabilities": 50.0,
+        "inventory": null
+      },
+      "income_statement": {},
+      "cash_flow_statement": {},
+      "expected": {
+        "quick_ratio": null
+      }
+    },
+    {
+      "name": "derived_gross_profit",
+      "balance_sheet": {},
+      "income_statement": {
+        "revenue": 80.0,
+        "cost_of_revenue": 50.0
+      },
+      "cash_flow_statement": {},
+      "expected": {
+        "gross_margin": 0.375
+      }
+    }
+  ]
+}

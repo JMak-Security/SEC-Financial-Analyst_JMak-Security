@@ -1,0 +1,36 @@
+{
+  "cik": 1,
+  "name": "Example Synthetic Holdings",
+  "tickers": [
+    "SYN"
+  ],
+  "filings": {
+    "recent": {
+      "form": [
+        "10-Q",
+        "10-Q",
+        "10-K"
+      ],
+      "filingDate": [
+        "2026-11-01",
+        "2026-08-01",
+        "2026-03-01"
+      ],
+      "reportDate": [
+        "2026-09-30",
+        "2026-06-30",
+        "2025-12-31"
+      ],
+      "accessionNumber": [
+        "0000000001-26-000003",
+        "0000000001-26-000002",
+        "0000000001-26-000001"
+      ],
+      "primaryDocument": [
+        "sample-q3.htm",
+        "sample-q2.htm",
+        "sample-10k.htm"
+      ]
+    }
+  }
+}

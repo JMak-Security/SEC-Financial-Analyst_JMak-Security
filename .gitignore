@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+financials.sqlite3
+.streamlit/secrets.toml
+data/
+dist/
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+incoming/
+sec_cache/
+reports/

@@ -1,0 +1,40 @@
+{
+  "description": "Routing test cases only; contains no company financial data.",
+  "cases": [
+    {
+      "query": "NVIDIA",
+      "display_name": "NVIDIA Corporation",
+      "ticker": "NVDA",
+      "cik": "0001045810",
+      "filing_status": "sec_filer"
+    },
+    {
+      "query": "Nividia",
+      "display_name": "NVIDIA Corporation",
+      "ticker": "NVDA",
+      "cik": "0001045810",
+      "filing_status": "sec_filer"
+    },
+    {
+      "query": "Votee AI",
+      "display_name": "Votee AI",
+      "ticker": null,
+      "cik": null,
+      "filing_status": "private_or_unverified"
+    },
+    {
+      "query": "Wonderful",
+      "display_name": "Wonderful",
+      "ticker": null,
+      "cik": null,
+      "filing_status": "ambiguous_private_company"
+    },
+    {
+      "query": "PwC",
+      "display_name": "PwC",
+      "ticker": null,
+      "cik": null,
+      "filing_status": "private_or_network_structure"
+    }
+  ]
+}
