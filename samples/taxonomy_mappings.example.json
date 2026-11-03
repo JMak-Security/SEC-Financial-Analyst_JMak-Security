@@ -1,0 +1,8 @@
+{
+  "custom_gaap": {
+    "revenue": "issuer:Revenue"
+  },
+  "non_gaap": {
+    "net_income": "issuer:AdjustedNetIncome"
+  }
+}

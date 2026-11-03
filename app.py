@@ -12,6 +12,7 @@ import streamlit as st
 
 from sec_analyst.agent import AnalysisResult, FinancialAnalystAgent
 from sec_analyst.edgar import SecApiError, SecEdgarClient
+from sec_analyst.health import FinancialHealthAnalyst
 from sec_analyst.health import render_health_markdown
 from sec_analyst.workspace import WorkspaceManager
 
@@ -69,6 +70,20 @@ def _show_result(result: AnalysisResult) -> None:
             )
             st.dataframe(
                 report["market_risk"]["stress_results"],
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.markdown("#### Reference stress tests (illustrative)")
+            st.caption(report["market_risk"]["stress_framework_note"])
+            st.dataframe(
+                [
+                    {
+                        "Scenario": item["scenario"]["title"],
+                        "Estimated loss": item["loss"],
+                        "Reference": item["scenario"]["reference_url"],
+                    }
+                    for item in report["market_risk"]["reference_stress_results"]
+                ],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -169,6 +184,22 @@ def main() -> None:
             help="A real contact email is required by SEC fair-access guidance.",
         )
         filing_count = st.slider("Recent filings", min_value=1, max_value=8, value=4)
+        market_simulations = st.number_input(
+            "Market-risk Monte Carlo paths",
+            min_value=100,
+            max_value=1_000_000,
+            value=20_000,
+            step=10_000,
+            help="Chunked simulation. Runtime depends on hardware, horizon, and asset count.",
+        )
+        risk_backend = st.selectbox(
+            "Simulation execution",
+            options=["local", "dask"],
+            help=(
+                "Dask starts a local distributed worker pool. Configure "
+                "DASK_SCHEDULER_ADDRESS to use an existing cluster."
+            ),
+        )
 
     if workspace is None:
         return
@@ -183,8 +214,14 @@ def main() -> None:
     if fetch_submitted:
         try:
             client = SecEdgarClient(contact_email)
+            health_analyst = FinancialHealthAnalyst(
+                market_simulations=int(market_simulations),
+                risk_backend=risk_backend,
+            )
             result = asyncio.run(
-                FinancialAnalystAgent(workspace, client).analyze_sec(
+                FinancialAnalystAgent(
+                    workspace, client, health_analyst=health_analyst
+                ).analyze_sec(
                     company, filing_count
                 )
             )
@@ -243,10 +280,40 @@ def main() -> None:
                     manual_company,
                     manual_upload.getvalue(),
                     ticker=manual_ticker.strip() or None,
+                    health_analyst=FinancialHealthAnalyst(
+                        market_simulations=int(market_simulations),
+                        risk_backend=risk_backend,
+                    ),
                 )
             )
             st.session_state["analysis_result"] = result.as_dict()
         except (OSError, ValueError, RuntimeError) as exc:
+            st.error(str(exc))
+
+    st.markdown("### Optional issuer taxonomy crosswalk")
+    st.caption(
+        "Upload a mapping for issuer extension tags and explicitly labeled "
+        "non-GAAP values. The report keeps non-GAAP amounts separate and "
+        "does not silently substitute them into GAAP ratios."
+    )
+    taxonomy_upload = st.file_uploader(
+        "Taxonomy mapping JSON",
+        type=["json"],
+        key="taxonomy_mapping_upload",
+        help=(
+            'Example: {"custom_gaap":{"revenue":"issuer:Revenue"},'
+            '"non_gaap":{"net_income":"issuer:AdjustedNetIncome"}}'
+        ),
+    )
+    if taxonomy_upload and st.button("Save taxonomy mapping to managed folder"):
+        try:
+            from sec_analyst.taxonomy import TaxonomyMappings
+
+            TaxonomyMappings.from_json(taxonomy_upload.getvalue())
+            mapping_path = workspace.root / "taxonomy_mappings.json"
+            mapping_path.write_bytes(taxonomy_upload.getvalue())
+            st.success("Validated mapping saved to the active managed folder.")
+        except (OSError, ValueError) as exc:
             st.error(str(exc))
 
     st.markdown("### Analyze local SEC JSON")

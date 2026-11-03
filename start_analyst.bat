@@ -39,7 +39,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%ANALYST_PYTHON%" -c "import streamlit, requests, numpy, scipy, pandas" >nul 2>&1
+"%ANALYST_PYTHON%" -c "import streamlit, requests, numpy, scipy, pandas, duckdb" >nul 2>&1
 if errorlevel 1 (
     echo Installing application dependencies...
     "%ANALYST_PYTHON%" -m pip install -r "%PROJECT_DIR%requirements.txt"

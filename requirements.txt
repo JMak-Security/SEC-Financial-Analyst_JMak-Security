@@ -3,3 +3,4 @@ streamlit>=1.36
 numpy>=1.26
 scipy>=1.11
 pandas>=2.1
+duckdb>=1.1

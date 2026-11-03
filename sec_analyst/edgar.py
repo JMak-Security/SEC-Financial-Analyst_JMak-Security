@@ -6,13 +6,31 @@ import re
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .companies import identify_company
+from .inline_xbrl import parse_inline_xbrl
 from .models import Filing
 
 
 class SecApiError(RuntimeError):
     """Raised when an SEC request or response cannot be used."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _is_transient_request_error(exc: requests.RequestException) -> bool:
+    status = getattr(exc.response, "status_code", None)
+    return isinstance(
+        exc,
+        (
+            requests.ConnectionError,
+            requests.Timeout,
+        ),
+    ) or status in {429, 500, 502, 503, 504}
 
 
 class SecEdgarClient:
@@ -31,6 +49,22 @@ class SecEdgarClient:
                 "Accept-Encoding": "gzip, deflate",
             }
         )
+        self.session.mount(
+            "https://",
+            HTTPAdapter(
+                max_retries=Retry(
+                    total=5,
+                    connect=5,
+                    read=3,
+                    status=5,
+                    backoff_factor=0.75,
+                    status_forcelist=(429, 500, 502, 503, 504),
+                    allowed_methods=frozenset({"GET"}),
+                    respect_retry_after_header=True,
+                    raise_on_status=False,
+                )
+            ),
+        )
 
     def _get_json(self, url: str) -> dict[str, Any]:
         try:
@@ -38,7 +72,10 @@ class SecEdgarClient:
             response.raise_for_status()
             payload = response.json()
         except requests.RequestException as exc:
-            raise SecApiError(f"SEC request failed for {url}: {exc}") from exc
+            raise SecApiError(
+                f"SEC request failed for {url}: {exc}",
+                retryable=_is_transient_request_error(exc),
+            ) from exc
         except ValueError as exc:
             raise SecApiError(f"SEC returned invalid JSON for {url}.") from exc
         if not isinstance(payload, dict):
@@ -78,6 +115,45 @@ class SecEdgarClient:
         )
         return submissions, facts
 
+    def fetch_inline_xbrl_facts(
+        self, filing: Filing, max_bytes: int = 20_000_000
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        document = filing.primary_document.strip()
+        if (
+            not document
+            or "/" in document
+            or "\\" in document
+            or document in {".", ".."}
+        ):
+            raise ValueError("SEC filing has no safe primary document filename.")
+        cik_digits = filing.cik.lstrip("0") or "0"
+        accession_path = filing.accession_number.replace("-", "")
+        url = (
+            "https://www.sec.gov/Archives/edgar/data/"
+            f"{cik_digits}/{accession_path}/{document}"
+        )
+        try:
+            response = self.session.get(url, timeout=self.timeout)
+            response.raise_for_status()
+            if len(response.content) > max_bytes:
+                raise SecApiError(
+                    f"SEC filing document exceeds the {max_bytes:,}-byte limit."
+                )
+            parsed = parse_inline_xbrl(
+                response.content,
+                accession=filing.accession_number,
+                form=filing.form,
+                filing_date=filing.filing_date,
+                period_end=filing.period_end,
+                max_bytes=max_bytes,
+            )
+        except requests.RequestException as exc:
+            raise SecApiError(
+                f"SEC filing request failed for {url}: {exc}",
+                retryable=_is_transient_request_error(exc),
+            ) from exc
+        return parsed["facts"]
+
 
 def recent_filings(submissions: dict[str, Any], cik: str, limit: int) -> list[Filing]:
     """Return recent, non-amended 10-K/10-Q filings with a reported period end."""
@@ -96,6 +172,7 @@ def recent_filings(submissions: dict[str, Any], cik: str, limit: int) -> list[Fi
     filing_dates = recent.get("filingDate", [])
     report_dates = recent.get("reportDate", [])
     documents = recent.get("primaryDocument", [])
+    acceptance_times = recent.get("acceptanceDateTime", [])
     if not isinstance(forms, list) or not isinstance(accessions, list):
         raise ValueError("SEC submissions filing arrays have an invalid format.")
     if not isinstance(filing_dates, list) or not isinstance(report_dates, list):
@@ -123,6 +200,12 @@ def recent_filings(submissions: dict[str, Any], cik: str, limit: int) -> list[Fi
                 period_end=period_end,
                 primary_document=(
                     str(documents[index] or "") if index < len(documents) else ""
+                ),
+                acceptance_timestamp=(
+                    str(acceptance_times[index] or "")
+                    if isinstance(acceptance_times, list)
+                    and index < len(acceptance_times)
+                    else ""
                 ),
             )
         )

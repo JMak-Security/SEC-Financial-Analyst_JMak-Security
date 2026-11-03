@@ -30,6 +30,12 @@ class ReleasePackageTests(unittest.TestCase):
                 project_readme = archive.read(f"{root}/README.md")
                 release_readme = archive.read(f"{root}/RELEASE_README.md")
                 self.assertNotEqual(project_readme, release_readme)
+                self.assertIn(
+                    f"v{version()}".encode("utf-8"), project_readme
+                )
+                self.assertIn(
+                    f"v{version()}".encode("utf-8"), release_readme
+                )
                 self.assertNotIn("/data/", "\n".join(names).replace("\\", "/"))
                 self.assertFalse(any("__pycache__" in name for name in names))
                 self.assertFalse(any(".pyc" in name for name in names))

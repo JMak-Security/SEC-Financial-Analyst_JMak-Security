@@ -1,6 +1,6 @@
 # SEC Financial Analyst
 
-Current release: **v1.0.0** (`VERSION`). Downloadable Windows distribution
+Current release: **v1.1.0** (`VERSION`). Downloadable Windows distribution
 includes a separate [release guide](./RELEASE_README.md); the project README
 remains the detailed reference for development, data handling, and analysis
 methodology.
@@ -21,10 +21,18 @@ research aid, not investment advice.
 
 - Retrieves company submissions and standardized XBRL facts from the SEC EDGAR
   APIs using a user-supplied contact email in the required `User-Agent`.
+- Validates the CompanyFacts payload structure, filing accession, units, dates,
+  numeric values, and XBRL context period consistency before normalization.
+- Parses bounded SEC Inline XBRL filing documents for issuer-extension facts,
+  contexts, explicit dimensions, scales, units, and inline element IDs.
+- Supports an explicit custom-tag and non-GAAP crosswalk. Non-GAAP values are
+  reported and reconciled separately; they are never silently substituted into
+  GAAP ratio calculations.
 - Selects recent 10-K/10-Q accessions and maps balance-sheet instant facts and
   income/cash-flow duration facts to the matching accession and period.
 - Stores filing metadata, normalized statement line items, and ratios in
-  SQLite, and saves raw SEC responses and JSON reports in a user-selected folder.
+  SQLite, and saves append-only, SHA-256-digested analysis versions with XBRL
+  lineage in DuckDB. Query prior snapshots as of a timestamp.
 - Calculates liquidity, solvency, profitability, and cash-flow ratios. Missing
   values and zero denominators are reported as unavailable, not fabricated.
 - Produces a financial-health writeup with evidence-linked findings and
@@ -32,6 +40,16 @@ research aid, not investment advice.
 - Integrates portfolio-risk VaR/CVaR, seeded Monte Carlo, and stress analysis
   for read-only public-equity daily price history. This is market-price risk,
   not company solvency risk.
+- Supports memory-bounded Monte Carlo simulation up to 5,000,000 paths with
+  optional Dask distributed workers. Performance is hardware-, horizon-, and
+  portfolio-dependent; no fixed latency is guaranteed.
+- Provides an optional Alpaca minute-bar WebSocket to Kafka/Redpanda pipeline
+  for rolling risk snapshots, with exponential reconnect backoff. It publishes
+  market and risk events only; it does not place orders.
+- Includes transparent historical-return replay, duration-based interest-rate
+  curve shifts, and illustrative equity/FX scenarios with links to Basel/Federal
+  Reserve references. These templates are not official regulatory prescriptions
+  or a regulatory capital result.
 - Supports optional Brave Search API web research and read-only Yahoo Finance
   quote/history lookups. Search snippets are unverified research leads.
 - Accepts user-supplied multi-period CSV statements for private companies,
@@ -84,6 +102,49 @@ To run tests without contacting EDGAR:
 python -m unittest discover -s tests -v
 ```
 
+### Optional production integrations
+
+The default install remains suitable for offline use. To install Dask,
+Prefect, WebSocket streaming, and Kafka integrations:
+
+```powershell
+python -m pip install -r production_requirements.txt
+```
+
+For Dask, select `dask` in the UI or pass `backend="dask"` to
+`RiskEngine.simulate_monte_carlo`. Without `DASK_SCHEDULER_ADDRESS`, the engine
+starts a temporary local Dask worker pool; to use a cluster, set
+`DASK_SCHEDULER_ADDRESS` to its trusted scheduler endpoint. Chunk size bounds
+per-task memory. Run `python scripts\benchmark_risk.py --paths 1000000` on the
+target host to measure actual throughput. A million paths in under five
+seconds is a deployment benchmark target, not a portable guarantee.
+On the development host (Windows 11, Python 3.12.10), the provided benchmark
+completed 1,000,000 paths across 8 assets, one-day horizon, and 25,000-path
+chunks using Dask in 0.819 seconds. Re-run the benchmark on your deployment
+hardware rather than extrapolating this result.
+
+The Alpaca/Kafka pipeline is opt-in. Set `ALPACA_API_KEY`,
+`ALPACA_API_SECRET`, `ALPACA_FEED` (`iex` or `sip`), and
+`KAFKA_BOOTSTRAP_SERVERS`, then call `run_alpaca_kafka_stream` from
+`portfolio_risk.streaming`. Alpaca feed entitlements and Kafka topic/ACL setup
+are the operator's responsibility. The stream emits minute bars to
+`market.bars` and rolling risk JSON to `risk.snapshots`; it sends no order
+messages. Kafka defaults to `PLAINTEXT` for local development. For deployments,
+set `KAFKA_SECURITY_PROTOCOL` to `SSL`, `SASL_SSL`, or `SASL_PLAINTEXT` as
+appropriate; SASL also requires `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`,
+and `KAFKA_SASL_PASSWORD`. Optional TLS settings are
+`KAFKA_SSL_CAFILE`, `KAFKA_SSL_CERTFILE`, and `KAFKA_SSL_KEYFILE`. Supply an
+async `status_callback` to connect disconnects, invalid bars, and snapshots to
+your alerting system.
+
+`sec_analyst.prefect_flow.analyze_company_flow` provides an optional Prefect
+flow with task retries and failure logging. Set `SEC_ALERT_WEBHOOK_URL` to
+deliver failure notifications to a compatible webhook. Deploy it through your
+Prefect server/work-pool configuration; keep the SEC contact email and API
+credentials in the deployment's secret store, never in the repository. EDGAR
+and market GET requests separately retry HTTP 429 and transient 5xx responses
+while respecting `Retry-After`.
+
 ## Workspace and data handling
 
 The selected folder is the boundary for application-managed data. The app
@@ -117,6 +178,32 @@ debt-to-equity. Free cash flow is operating cash flow less the absolute value
 of reported capital expenditures. Ratios are omitted when required source
 facts are missing or a denominator is zero. SEC CompanyFacts only exposes
 standardized facts; issuer-specific custom XBRL tags may not be represented.
+Inline XBRL fact lineage records accession, form, period, unit, filing date,
+SEC acceptance timestamp where supplied, taxonomy concept, context/dimensions,
+and an exact filing-document link (including the Inline XBRL element ID when
+available). SEC CompanyFacts primarily exposes standardized facts; custom
+Inline XBRL tags require an explicit taxonomy mapping. The SEC CompanyFacts API
+does **not** supply printed PDF page numbers. Page numbers are therefore left
+unavailable rather than fabricated; the accession-linked HTML filing is the
+source of record. XBRL values can
+contain dimensional facts that are not interchangeable with consolidated
+amounts; inspect contexts and crosswalks before using issuer extensions.
+
+DuckDB's `analysis_versions` table is append-only through the application API.
+Each run receives a UUID, UTC observation timestamp, normalized statements,
+ratios, accession-linked source metadata, and a canonical SHA-256 digest.
+`DuckDBFinancialStore.versions_for_accession()` returns every observed
+version; `as_of(accession, timestamp)` retrieves the most recent snapshot at
+that time. This is application-level time travel, not tamper-proof storage:
+restrict write access and back up the database.
+
+Regulatory reference shocks are illustrative only. Basel FRTB calculations
+require prescribed risk-factor mappings, liquidity horizons, expected-shortfall
+aggregation, modellability evidence, and jurisdiction-specific rules. The
+included duration approximation omits convexity and basis risk. Historical
+replay is only as complete as the supplied market data. Neither output is a
+supervisory stress result, regulatory capital calculation, or compliance
+opinion.
 
 ## Project layout
 
@@ -125,7 +212,9 @@ app.py
 start_analyst.bat   Double-click local Windows launcher
 launch.py           Waits for server health, opens browser, cleans up on exit
 sec_analyst/        EDGAR, normalization, ratios, health, market/search agents
-portfolio_risk/     VaR/CVaR, Monte Carlo, and scenario stress engine
+portfolio_risk/     VaR/CVaR, chunked/Dask Monte Carlo, streaming, stress tests
+production_requirements.txt
+                    Optional Dask, Prefect, Alpaca WebSocket, Kafka dependencies
 sql/schema.sql      SQLite schema
 scripts/            Synthetic sample generator
 samples/            Synthetic 10-K/10-Q submissions and CompanyFacts JSON

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import os
 from typing import Mapping
 
 import numpy as np
@@ -69,6 +71,8 @@ class RiskEngine:
             raise ValueError("Every asset return must be numeric.") from exc
         if not np.isfinite(values).all():
             raise ValueError("Returns must not contain missing or non-finite values.")
+        if np.any(values < -1.0):
+            raise ValueError("Simple asset returns must not be below -100%.")
 
         asset_names = list(frame.columns)
         missing = [asset for asset in asset_names if asset not in weights]
@@ -161,25 +165,95 @@ class RiskEngine:
         horizon_days: int = 1,
         simulations: int = 20_000,
         seed: int = 42,
+        backend: str = "local",
+        chunk_size: int = 20_000,
+        dask_client: object | None = None,
     ) -> MonteCarloReport:
         self._validate_parameters(confidence, portfolio_value, horizon_days)
-        if isinstance(simulations, bool) or not 100 <= simulations <= 1_000_000:
-            raise ValueError("Simulation count must be between 100 and 1,000,000.")
+        if (
+            isinstance(simulations, bool)
+            or not isinstance(simulations, int)
+            or not 100 <= simulations <= 5_000_000
+        ):
+            raise ValueError("Simulation count must be between 100 and 5,000,000.")
         if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
             raise ValueError("Seed must be an integer.")
+        if backend not in {"local", "dask"}:
+            raise ValueError("Backend must be 'local' or 'dask'.")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError("Chunk size must be a positive whole number.")
+        if dask_client is not None and backend != "dask":
+            raise ValueError("A Dask client can only be used with backend='dask'.")
         mean = np.mean(self.returns, axis=0)
         covariance = np.atleast_2d(np.cov(self.returns, rowvar=False, ddof=1))
-        rng = np.random.default_rng(int(seed))
-        simulated_daily = rng.multivariate_normal(
-            mean=mean,
-            cov=covariance,
-            size=(simulations, horizon_days),
-            check_valid="raise",
-            method="eigh",
-        )
-        simulated_asset_returns = np.prod(1.0 + simulated_daily, axis=1) - 1.0
-        simulated_portfolio_returns = simulated_asset_returns @ self.weights_array
-        losses = -simulated_portfolio_returns * portfolio_value
+        if not np.isfinite(mean).all() or not np.isfinite(covariance).all():
+            raise ValueError("Return estimates must be finite for simulation.")
+        if np.linalg.eigvalsh(covariance).min() < -1e-10:
+            raise ValueError("Return covariance matrix must be positive semidefinite.")
+        chunk_count = math.ceil(simulations / chunk_size)
+        child_seeds = np.random.SeedSequence(int(seed)).spawn(chunk_count)
+        chunk_sizes = [
+            min(chunk_size, simulations - index * chunk_size)
+            for index in range(chunk_count)
+        ]
+        if backend == "dask":
+            try:
+                from dask import delayed
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Dask backend requires the optional 'dask[distributed]' dependency."
+                ) from exc
+            managed_client = None
+            jobs = [
+                delayed(_simulate_loss_chunk)(
+                    mean,
+                    covariance,
+                    self.weights_array,
+                    float(portfolio_value),
+                    int(horizon_days),
+                    size,
+                    child_seed.generate_state(1, dtype=np.uint64)[0].item(),
+                )
+                for size, child_seed in zip(chunk_sizes, child_seeds, strict=True)
+            ]
+            try:
+                active_client = dask_client
+                if active_client is None:
+                    try:
+                        from distributed import Client
+                    except ImportError as exc:
+                        raise RuntimeError(
+                            "Dask distributed execution requires "
+                            "'dask[distributed]'."
+                        ) from exc
+                    scheduler_address = os.environ.get(
+                        "DASK_SCHEDULER_ADDRESS", ""
+                    ).strip()
+                    managed_client = (
+                        Client(scheduler_address)
+                        if scheduler_address
+                        else Client(processes=False)
+                    )
+                    active_client = managed_client
+                futures = active_client.compute(jobs)
+                chunk_losses = active_client.gather(futures)
+            finally:
+                if managed_client is not None:
+                    managed_client.close()
+        else:
+            chunk_losses = [
+                _simulate_loss_chunk(
+                    mean,
+                    covariance,
+                    self.weights_array,
+                    float(portfolio_value),
+                    int(horizon_days),
+                    size,
+                    child_seed.generate_state(1, dtype=np.uint64)[0].item(),
+                )
+                for size, child_seed in zip(chunk_sizes, child_seeds, strict=True)
+            ]
+        losses = np.concatenate(chunk_losses)
         loss_quantile = float(np.quantile(losses, confidence))
         tail_losses = losses[losses >= loss_quantile]
         return MonteCarloReport(
@@ -200,6 +274,9 @@ class RiskEngine:
         horizon_days: int = 1,
         simulations: int = 20_000,
         seed: int = 42,
+        backend: str = "local",
+        chunk_size: int = 20_000,
+        dask_client: object | None = None,
     ) -> MonteCarloReport:
         """Run CPU-bound simulation off the active asyncio event loop."""
         import asyncio
@@ -211,6 +288,9 @@ class RiskEngine:
             horizon_days,
             simulations,
             seed,
+            backend,
+            chunk_size,
+            dask_client,
         )
 
     def stress_test(
@@ -250,3 +330,24 @@ class RiskEngine:
                 )
             )
         return results
+
+
+def _simulate_loss_chunk(
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    weights: np.ndarray,
+    portfolio_value: float,
+    horizon_days: int,
+    simulations: int,
+    seed: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    simulated_daily = rng.multivariate_normal(
+        mean=mean,
+        cov=covariance,
+        size=(simulations, horizon_days),
+        check_valid="raise",
+        method="eigh",
+    )
+    simulated_asset_returns = np.prod(1.0 + simulated_daily, axis=1) - 1.0
+    return -(simulated_asset_returns @ weights) * portfolio_value

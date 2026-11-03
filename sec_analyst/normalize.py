@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Any, Mapping
 
 from .models import Filing, FinancialStatements
+from .taxonomy import reconcile_non_gaap
 
 BALANCE_TAGS: dict[str, tuple[str, ...]] = {
     "cash_and_equivalents": (
@@ -99,10 +100,17 @@ def _select_value(
     filing: Filing,
     is_instant: bool,
     currency: str,
-) -> tuple[float | None, str | None]:
-    namespaces = facts.get("facts", {}).get("us-gaap", {})
-    for tag in aliases:
-        concept = namespaces.get(tag)
+) -> tuple[float | None, str | None, dict[str, Any] | None]:
+    facts_root = facts.get("facts", {})
+    tags = [
+        (alias.split(":", 1)[0], alias.split(":", 1)[1])
+        if ":" in alias
+        else ("us-gaap", alias)
+        for alias in aliases
+    ]
+    for namespace, tag in tags:
+        concepts = facts_root.get(namespace, {})
+        concept = concepts.get(tag) if isinstance(concepts, dict) else None
         if not isinstance(concept, dict):
             continue
         units = concept.get("units", {})
@@ -147,18 +155,35 @@ def _select_value(
             )
         if selected is not None:
             try:
-                return float(selected["val"]), tag
+                return float(selected["val"]), f"{namespace}:{tag}", selected
             except (KeyError, TypeError, ValueError):
                 continue
-    return None, None
+    return None, None, None
 
 
-def _currency_for_filing(facts: dict[str, Any], filing: Filing) -> str:
-    namespaces = facts.get("facts", {}).get("us-gaap", {})
-    revenue_concepts = INCOME_TAGS["revenue"]
+def _currency_for_filing(
+    facts: dict[str, Any],
+    filing: Filing,
+    custom_tag_mappings: Mapping[str, str] | None = None,
+    non_gaap_tag_mappings: Mapping[str, str] | None = None,
+) -> str:
+    facts_root = facts.get("facts", {})
+    revenue_concepts = [
+        ("us-gaap", tag) for tag in INCOME_TAGS["revenue"]
+    ]
+    for mapping in (custom_tag_mappings or {}, non_gaap_tag_mappings or {}):
+        mapped_revenue = mapping.get("revenue")
+        if mapped_revenue:
+            namespace, tag = mapped_revenue.split(":", 1)
+            revenue_concepts.append((namespace, tag))
     available: set[str] = set()
-    for tag in revenue_concepts:
-        concept = namespaces.get(tag)
+    for namespace, tag in revenue_concepts:
+        namespace_facts = facts_root.get(namespace, {})
+        concept = (
+            namespace_facts.get(tag)
+            if isinstance(namespace_facts, dict)
+            else None
+        )
         if not isinstance(concept, dict):
             continue
         for unit, entries in concept.get("units", {}).items():
@@ -182,7 +207,10 @@ def _currency_for_filing(facts: dict[str, Any], filing: Filing) -> str:
 
 
 def normalize_companyfacts(
-    companyfacts: dict[str, Any], filing: Filing
+    companyfacts: dict[str, Any],
+    filing: Filing,
+    custom_tag_mappings: Mapping[str, str] | None = None,
+    non_gaap_tag_mappings: Mapping[str, str] | None = None,
 ) -> FinancialStatements:
     """Extract one filing's balance-sheet, income, and cash-flow values."""
     facts_root = companyfacts.get("facts")
@@ -190,25 +218,140 @@ def normalize_companyfacts(
     if not isinstance(facts, dict):
         raise ValueError("CompanyFacts payload has no standardized us-gaap facts.")
 
-    currency = _currency_for_filing(companyfacts, filing)
+    custom_tag_mappings = custom_tag_mappings or {}
+    non_gaap_tag_mappings = non_gaap_tag_mappings or {}
+    currency = _currency_for_filing(
+        companyfacts, filing, custom_tag_mappings, non_gaap_tag_mappings
+    )
     statements: dict[str, dict[str, float | None]] = {
         "balance_sheet": {},
         "income_statement": {},
         "cash_flow_statement": {},
     }
     source_tags: dict[str, str] = {}
+    fact_lineage: dict[str, dict[str, Any]] = {}
     for statement_name, tag_map, is_instant in (
         ("balance_sheet", BALANCE_TAGS, True),
         ("income_statement", INCOME_TAGS, False),
         ("cash_flow_statement", CASH_FLOW_TAGS, False),
     ):
         for metric, aliases in tag_map.items():
-            value, tag = _select_value(
-                companyfacts, aliases, filing, is_instant, currency
+            tags = aliases
+            custom_tag = custom_tag_mappings.get(metric)
+            if custom_tag:
+                tags = (custom_tag, *aliases)
+            value, tag, selected = _select_value(
+                companyfacts, tags, filing, is_instant, currency
             )
             statements[statement_name][metric] = value
-            if tag:
-                source_tags[metric] = f"us-gaap:{tag}"
+            if tag and selected:
+                source_tags[metric] = tag
+                cik_digits = filing.cik.lstrip("0") or "0"
+                accession_path = filing.accession_number.replace("-", "")
+                document_url = (
+                    "https://www.sec.gov/Archives/edgar/data/"
+                    f"{cik_digits}/{accession_path}/{filing.primary_document}"
+                    if filing.primary_document
+                    else ""
+                )
+                element_id = str(selected.get("element_id") or "")
+                fact_lineage[metric] = {
+                    "taxonomy_concept": tag,
+                    "unit": currency,
+                    "value": value,
+                    "accession_number": filing.accession_number,
+                    "form": filing.form,
+                    "period_start": str(selected.get("start") or ""),
+                    "period_end": str(selected.get("end") or ""),
+                    "fact_filed_date": str(selected.get("filed") or ""),
+                    "acceptance_timestamp": filing.acceptance_timestamp,
+                    "fiscal_year": selected.get("fy"),
+                    "fiscal_period": str(selected.get("fp") or ""),
+                    "frame": str(selected.get("frame") or ""),
+                    "filing_document_url": document_url,
+                    "companyfacts_url": (
+                        f"https://data.sec.gov/api/xbrl/companyfacts/CIK"
+                        f"{filing.cik.zfill(10)}.json"
+                    ),
+                    "page_number": None,
+                    "page_number_note": (
+                        "CompanyFacts does not provide printed page numbers; "
+                        "see the accession-linked Inline XBRL filing document."
+                    ),
+                    "inline_element_id": element_id,
+                    "inline_anchor_url": (
+                        f"{document_url}#{element_id}"
+                        if document_url and element_id
+                        else document_url
+                    ),
+                    "inline_context_ref": str(selected.get("context_ref") or ""),
+                    "inline_format": str(selected.get("inline_format") or ""),
+                    "inline_scale": str(selected.get("scale") or ""),
+                    "dimensions": selected.get("dimensions", {}),
+                }
+
+    reported_non_gaap: dict[str, float | None] = {}
+    for metric, qualified_tag in non_gaap_tag_mappings.items():
+        value, tag, selected = _select_value(
+            companyfacts,
+            (qualified_tag,),
+            filing,
+            is_instant=metric
+            in {
+                "cash_and_equivalents",
+                "current_assets",
+                "current_liabilities",
+                "total_assets",
+                "total_liabilities",
+                "shareholders_equity",
+            },
+            currency=currency,
+        )
+        reported_non_gaap[metric] = value
+        if tag and selected:
+            source_key = f"non_gaap:{metric}"
+            source_tags[source_key] = tag
+            fact_lineage[source_key] = {
+                "taxonomy_concept": tag,
+                "unit": currency,
+                "value": value,
+                "accession_number": filing.accession_number,
+                "form": filing.form,
+                "period_start": str(selected.get("start") or ""),
+                "period_end": str(selected.get("end") or ""),
+                "fact_filed_date": str(selected.get("filed") or ""),
+                "acceptance_timestamp": filing.acceptance_timestamp,
+                "fiscal_year": selected.get("fy"),
+                "fiscal_period": str(selected.get("fp") or ""),
+                "frame": str(selected.get("frame") or ""),
+                "filing_document_url": (
+                    "https://www.sec.gov/Archives/edgar/data/"
+                    f"{filing.cik.lstrip('0') or '0'}/"
+                    f"{filing.accession_number.replace('-', '')}/"
+                    f"{filing.primary_document}"
+                    if filing.primary_document
+                    else ""
+                ),
+                "companyfacts_url": (
+                    f"https://data.sec.gov/api/xbrl/companyfacts/CIK"
+                    f"{filing.cik.zfill(10)}.json"
+                ),
+                "inline_element_id": str(selected.get("element_id") or ""),
+                "inline_context_ref": str(selected.get("context_ref") or ""),
+                "inline_format": str(selected.get("inline_format") or ""),
+                "inline_scale": str(selected.get("scale") or ""),
+                "dimensions": selected.get("dimensions", {}),
+                "page_number": None,
+                "page_number_note": (
+                    "CompanyFacts does not provide printed page numbers; "
+                    "see the accession-linked Inline XBRL filing document."
+                ),
+            }
+    gaap_values = {
+        metric: statements[statement_name].get(metric)
+        for statement_name, values in statements.items()
+        for metric in values
+    }
 
     return FinancialStatements(
         filing=filing,
@@ -217,4 +360,9 @@ def normalize_companyfacts(
         cash_flow_statement=statements["cash_flow_statement"],
         source_tags=source_tags,
         currency=currency,
+        fact_lineage=fact_lineage,
+        reported_non_gaap=reported_non_gaap,
+        non_gaap_reconciliation=reconcile_non_gaap(
+            gaap_values, reported_non_gaap
+        ),
     )

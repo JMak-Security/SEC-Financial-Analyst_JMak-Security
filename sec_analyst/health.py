@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import pandas as pd
 
 from portfolio_risk.engine import RiskEngine
+from portfolio_risk.stress import apply_reference_scenario, reference_scenarios
 
 from .market import MarketDataError, YahooFinanceClient
 from .models import FinancialStatements
@@ -23,9 +24,19 @@ class FinancialHealthAnalyst:
         self,
         market_client: YahooFinanceClient | None = None,
         search_client: BraveSearchClient | None = None,
+        market_simulations: int = 20_000,
+        risk_backend: str = "local",
+        dask_client: object | None = None,
     ) -> None:
         self.market_client = market_client or YahooFinanceClient()
         self.search_client = search_client or BraveSearchClient()
+        if isinstance(market_simulations, bool) or not 100 <= market_simulations <= 5_000_000:
+            raise ValueError("Market simulations must be between 100 and 5,000,000.")
+        if risk_backend not in {"local", "dask"}:
+            raise ValueError("Risk backend must be 'local' or 'dask'.")
+        self.market_simulations = market_simulations
+        self.risk_backend = risk_backend
+        self.dask_client = dask_client
 
     async def analyze(
         self,
@@ -88,12 +99,36 @@ class FinancialHealthAnalyst:
                     engine = RiskEngine(returns, {result.ticker: 1.0})
                     risk = engine.calculate(10_000.0, confidence=0.95)
                     monte_carlo = await engine.simulate_monte_carlo_async(
-                        10_000.0, confidence=0.95, simulations=2_000, seed=42
+                        10_000.0,
+                        confidence=0.95,
+                        simulations=self.market_simulations,
+                        seed=42,
+                        backend=self.risk_backend,
+                        dask_client=self.dask_client,
                     )
                     stress = engine.stress_test(
                         {"Illustrative 20% equity-price shock": {result.ticker: -0.2}},
                         10_000.0,
                     )
+                    stress_values = [
+                        {
+                            "scenario": stress_result.scenario,
+                            "portfolio_return": stress_result.portfolio_return,
+                            "loss": stress_result.loss,
+                        }
+                        for stress_result in stress
+                    ]
+                    reference_stress = []
+                    for scenario in reference_scenarios():
+                        if "equity" not in scenario.shocks:
+                            continue
+                        applied = apply_reference_scenario(
+                            scenario,
+                            {result.ticker: 10_000.0},
+                            {result.ticker: "equity"},
+                            10_000.0,
+                        )
+                        reference_stress.append(applied.as_dict())
                     market_risk = {
                         "interpretation": (
                             "Public equity price-history risk only; not a measure of "
@@ -101,16 +136,24 @@ class FinancialHealthAnalyst:
                         ),
                         "risk": asdict(risk),
                         "monte_carlo": asdict(monte_carlo),
-                        "stress_results": [asdict(item) for item in stress],
+                        "stress_results": stress_values,
+                        "reference_stress_results": reference_stress,
+                        "stress_framework_note": (
+                            "Reference scenario names link to Basel/Federal Reserve "
+                            "frameworks, but scenario magnitudes here are illustrative "
+                            "and are not regulatory prescriptions or capital results."
+                        ),
+                        "simulation_backend": self.risk_backend,
                     }
                     tool_trace.extend(
                         [
                             "calculate 95% historical and parametric VaR/CVaR",
-                            "run seeded 2,000-path Monte Carlo simulation",
-                            "apply an illustrative equity-price stress scenario",
+                            f"run seeded {self.market_simulations:,}-path Monte Carlo "
+                            f"simulation with {self.risk_backend} backend",
+                            "apply configurable reference and illustrative equity stresses",
                         ]
                     )
-                except ValueError as exc:
+                except (ValueError, RuntimeError) as exc:
                     limitations.append(f"Market risk metrics unavailable: {exc}")
         if search_task is not None:
             result = results[result_index]
@@ -186,6 +229,7 @@ class FinancialHealthAnalyst:
                 "currency": item.currency,
                 "accession_number": item.filing.accession_number,
                 "source_tags": item.source_tags,
+                "fact_lineage": item.fact_lineage or {},
             }
             for item in ordered
         ]
@@ -202,6 +246,10 @@ class FinancialHealthAnalyst:
                     "form": item.filing.form,
                     "ratios": ratios,
                     "currency": item.currency,
+                    "reported_non_gaap": item.reported_non_gaap or {},
+                    "non_gaap_reconciliation": (
+                        item.non_gaap_reconciliation or {}
+                    ),
                 }
                 for item, ratios in zip(ordered, ratio_rows, strict=True)
             ],
@@ -376,6 +424,15 @@ def render_health_markdown(report: dict[str, Any]) -> str:
                 f"- {item['period_end']} ({item['form']}, {item['currency']}): "
                 f"{shown_ratios or 'no computable ratios'}"
             )
+            for metric, reconciliation in item["non_gaap_reconciliation"].items():
+                difference = reconciliation["absolute_difference"]
+                lines.append(
+                    f"  - {metric} GAAP/non-GAAP reconciliation: "
+                    f"{reconciliation['gaap_value']:,.2f} vs "
+                    f"{reconciliation['reported_non_gaap_value']:,.2f}; "
+                    f"difference {difference:+,.2f}. The GAAP ratio calculation "
+                    "does not substitute the non-GAAP amount."
+                )
     market_risk = report.get("market_risk")
     if market_risk:
         risk = market_risk["risk"]
@@ -404,6 +461,20 @@ def render_health_markdown(report: dict[str, Any]) -> str:
                 f"- {stress['scenario']}: estimated illustrative loss "
                 f"{stress['loss']:,.2f} on a notional 10,000."
             )
+        lines.extend(
+            [
+                "",
+                "Reference stress scenarios (illustrative, not regulatory results):",
+                market_risk["stress_framework_note"],
+            ]
+        )
+        for stress in market_risk["reference_stress_results"]:
+            scenario = stress["scenario"]
+            lines.append(
+                f"- {scenario['title']}: estimated price-shock loss "
+                f"{stress['loss']:,.2f} on notional 10,000. "
+                f"[Framework reference]({scenario['reference_url']})."
+            )
     if report["web_research"]:
         lines.extend(
             [
@@ -428,6 +499,18 @@ def render_health_markdown(report: dict[str, Any]) -> str:
                     for metric, tag in sorted(source["source_tags"].items())
                 )
                 lines.append(f"  - XBRL line-item tags: {tags}.")
+            for metric, lineage in sorted(source["fact_lineage"].items()):
+                source_url = lineage.get("inline_anchor_url") or lineage.get(
+                    "filing_document_url"
+                )
+                if source_url:
+                    lines.append(
+                        f"  - {metric} source: [{lineage.get('taxonomy_concept', metric)}]"
+                        f"({source_url}); accession "
+                        f"{lineage.get('accession_number')}, context "
+                        f"{lineage.get('inline_context_ref') or 'not supplied'}, "
+                        f"page number unavailable from CompanyFacts."
+                    )
     if report["limitations"]:
         lines.extend(["", "## Limitations"])
         lines.extend(f"- {item}" for item in report["limitations"])

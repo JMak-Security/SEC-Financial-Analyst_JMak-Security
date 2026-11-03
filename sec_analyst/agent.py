@@ -9,13 +9,17 @@ from pathlib import Path
 from typing import Any
 
 from .edgar import SecEdgarClient, recent_filings
+from .duckdb_store import DuckDBFinancialStore
 from .health import FinancialHealthAnalyst, render_health_markdown
+from .inline_xbrl import InlineXbrlError
 from .manual import parse_manual_financials_csv
 from .models import Filing, FinancialStatements
 from .normalize import normalize_companyfacts
 from .ratios import calculate_ratios
 from .storage import FinancialStore
+from .taxonomy import TaxonomyMappings
 from .workspace import WorkspaceManager
+from .xbrl_validation import XbrlValidationError, validate_companyfacts
 
 
 @dataclass
@@ -58,9 +62,21 @@ class FilingRetrievalAgent:
 
 class StatementNormalizationAgent:
     def normalize(
-        self, companyfacts: dict[str, Any], filings: list[Filing]
+        self,
+        companyfacts: dict[str, Any],
+        filings: list[Filing],
+        taxonomies: TaxonomyMappings | None = None,
     ) -> list[FinancialStatements]:
-        return [normalize_companyfacts(companyfacts, filing) for filing in filings]
+        taxonomies = taxonomies or TaxonomyMappings({}, {})
+        return [
+            normalize_companyfacts(
+                companyfacts,
+                filing,
+                custom_tag_mappings=taxonomies.custom_gaap,
+                non_gaap_tag_mappings=taxonomies.non_gaap,
+            )
+            for filing in filings
+        ]
 
 
 class RatioAnalysisAgent:
@@ -193,6 +209,9 @@ class FinancialAnalystAgent:
         self.workspace = workspace
         self.client = client
         self.store = FinancialStore(self.workspace.root / "financials.sqlite3")
+        self.lineage_store = DuckDBFinancialStore(
+            self.workspace.root / "financial_lineage.duckdb"
+        )
         self.normalizer = StatementNormalizationAgent()
         self.ratio_agent = RatioAnalysisAgent()
         self.synthesizer = SynthesisAgent()
@@ -211,6 +230,50 @@ class FinancialAnalystAgent:
         self.workspace.save_json(
             f"sec_cache/{cik}_companyfacts.json", companyfacts
         )
+        selected_filings = recent_filings(submissions, cik, filing_count)
+        inline_warnings: list[str] = []
+        for filing in selected_filings:
+            try:
+                inline_facts = await asyncio.to_thread(
+                    self.client.fetch_inline_xbrl_facts, filing
+                )
+            except (SecApiError, InlineXbrlError, ValueError) as exc:
+                inline_warnings.append(
+                    f"Inline XBRL for {filing.accession_number} could not be "
+                    f"loaded; custom-tag mapping may be incomplete: {exc}"
+                )
+                continue
+            facts_root = companyfacts.setdefault("facts", {})
+            for namespace, concepts in inline_facts.items():
+                target_namespace = facts_root.setdefault(namespace, {})
+                for concept, details in concepts.items():
+                    target_concept = target_namespace.setdefault(
+                        concept, {"units": {}}
+                    )
+                    target_units = target_concept.setdefault("units", {})
+                    for unit, entries in details["units"].items():
+                        existing = target_units.setdefault(unit, [])
+                        known_contexts = {
+                            (
+                                item.get("accn"),
+                                item.get("form"),
+                                item.get("start"),
+                                item.get("end"),
+                            )
+                            for item in existing
+                            if isinstance(item, dict)
+                        }
+                        existing.extend(
+                            entry
+                            for entry in entries
+                            if (
+                                entry.get("accn"),
+                                entry.get("form"),
+                                entry.get("start"),
+                                entry.get("end"),
+                            )
+                            not in known_contexts
+                        )
         return await self._analyze_payloads(
             submissions,
             companyfacts,
@@ -219,6 +282,7 @@ class FinancialAnalystAgent:
             "SEC EDGAR",
             ticker=self._company_ticker(company, submissions),
             use_live_sources=True,
+            ingestion_warnings=inline_warnings,
         )
 
     async def analyze_local(self, filing_count: int = 4) -> AnalysisResult:
@@ -240,13 +304,19 @@ class FinancialAnalystAgent:
         content: bytes,
         ticker: str | None = None,
         use_live_sources: bool = True,
+        health_analyst: FinancialHealthAnalyst | None = None,
     ) -> AnalysisResult:
         statements = parse_manual_financials_csv(content, company_name)
         ordered = sorted(
             statements, key=lambda item: item.filing.period_end, reverse=True
         )
         ratio_rows = self.ratio_agent.analyze(ordered)
-        health_report = await self.health_analyst.analyze(
+        for statement, ratios in zip(ordered, ratio_rows, strict=True):
+            await asyncio.to_thread(
+                self.lineage_store.save_analysis, statement, ratios
+            )
+        active_health_analyst = health_analyst or self.health_analyst
+        health_report = await active_health_analyst.analyze(
             company_name,
             ordered,
             ticker=ticker,
@@ -291,14 +361,33 @@ class FinancialAnalystAgent:
         source: str,
         ticker: str | None = None,
         use_live_sources: bool = False,
+        ingestion_warnings: list[str] | None = None,
     ) -> AnalysisResult:
         filings = recent_filings(submissions, cik, filing_count)
         if not filings:
             raise ValueError("No eligible SEC 10-K/10-Q filings were found.")
-        statements = self.normalizer.normalize(companyfacts, filings)
+        validation_issues = validate_companyfacts(companyfacts, expected_cik=cik)
+        for filing in filings:
+            validation_issues.extend(
+                validate_companyfacts(
+                    companyfacts,
+                    expected_cik=cik,
+                    filing_accession=filing.accession_number,
+                )
+            )
+        mappings_path = self.workspace.root / "taxonomy_mappings.json"
+        taxonomies = (
+            TaxonomyMappings.from_json(mappings_path.read_bytes())
+            if mappings_path.is_file()
+            else TaxonomyMappings({}, {})
+        )
+        statements = self.normalizer.normalize(companyfacts, filings, taxonomies)
         ratio_rows = self.ratio_agent.analyze(statements)
         for statement, ratios in zip(statements, ratio_rows, strict=True):
             await asyncio.to_thread(self.store.save_analysis, statement, ratios)
+            await asyncio.to_thread(
+                self.lineage_store.save_analysis, statement, ratios
+            )
         points, conclusion, warnings = self.synthesizer.synthesize(
             statements, ratio_rows
         )
@@ -309,6 +398,12 @@ class FinancialAnalystAgent:
             use_live_sources=use_live_sources,
         )
         warnings.extend(health_report["limitations"])
+        warnings.extend(ingestion_warnings or [])
+        warnings.extend(
+            f"XBRL validation warning at {issue.path}: {issue.message}"
+            for issue in validation_issues
+            if issue.severity == "warning"
+        )
         result = AnalysisResult(
             company_name=filings[0].company_name,
             cik=cik,
