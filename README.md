@@ -1,6 +1,6 @@
 # SEC Financial Analyst
 
-Current release: **v1.1.0** (`VERSION`). Downloadable Windows distribution
+Current release: **v1.1.1** (`VERSION`). Downloadable Windows distribution
 includes a separate [release guide](./RELEASE_README.md); the project README
 remains the detailed reference for development, data handling, and analysis
 methodology.
@@ -85,6 +85,10 @@ Facts JSON file, save them into the selected folder, and run offline analysis.
 The bundled samples are synthetic and can be copied/uploaded to try the offline
 workflow. `samples/edge_cases.json` documents zero-denominator, missing-input,
 and derived-margin examples covered by the tests.
+
+The [NVIDIA, Microsoft, and Alphabet comparison](./research/company_comparison_2026-11-08.md)
+is a dated example report based on each company's latest available 10-Q at the
+time of analysis.
 
 For private or non-SEC organizations, upload a UTF-8 CSV with one row per
 reporting period to **Private or non-SEC company financials**. Required columns

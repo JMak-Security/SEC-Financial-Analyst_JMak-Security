@@ -41,14 +41,18 @@ class ReleasePackageTests(unittest.TestCase):
                 self.assertFalse(any(".pyc" in name for name in names))
 
     def test_release_source_contains_no_local_database(self) -> None:
-        for path in ROOT.rglob("*"):
-            if path.is_file() and path.name in {
-                "financials.sqlite",
-                "financials.sqlite3",
-                "secrets.toml",
-                ".env",
-            }:
-                self.fail(f"Local-only file should not be in the project source: {path}")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = build_release(Path(temp_dir))
+            with ZipFile(archive_path) as archive:
+                forbidden_names = {
+                    "financials.sqlite",
+                    "financials.sqlite3",
+                    "secrets.toml",
+                    ".env",
+                }
+                for name in archive.namelist():
+                    if Path(name).name in forbidden_names:
+                        self.fail(f"Local-only file is in the release: {name}")
 
 
 if __name__ == "__main__":

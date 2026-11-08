@@ -1,4 +1,4 @@
-# SEC Financial Health Analyst — v1.1.0
+# SEC Financial Health Analyst — v1.1.1
 
 A local-first company financial-health screening app for SEC filings and
 user-supplied financial statements.
@@ -71,3 +71,7 @@ advice.
 
 See `README.md` for detailed metric definitions, data handling, sample inputs,
 and test instructions.
+
+The source bundle also includes a dated [NVIDIA, Microsoft, and Alphabet SEC
+filing comparison](./research/company_comparison_2026-11-08.md). Its figures
+reflect filings available on November 8, 2026, not live current data.

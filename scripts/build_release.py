@@ -46,24 +46,46 @@ def is_release_file(path: Path) -> bool:
     return path.is_file()
 
 
+def canonical_readme() -> Path:
+    for name in ("README.md", "README-2.md"):
+        candidate = ROOT / name
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError("Required release file missing: README.md")
+
+
 def build_release(output_dir: Path) -> Path:
     release_version = version()
     archive_name = f"SEC-Financial-Health-Analyst-v{release_version}.zip"
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / archive_name
     root_folder = archive_name.removesuffix(".zip")
+    readme = canonical_readme()
     release_files = sorted(
-        (path for path in ROOT.rglob("*") if is_release_file(path)),
+        (
+            path
+            for path in ROOT.rglob("*")
+            if is_release_file(path) and path.name != "README-2.md"
+        ),
         key=lambda item: item.relative_to(ROOT).as_posix().casefold(),
     )
+    if readme not in release_files:
+        release_files.append(readme)
     required = {"VERSION", "README.md", "RELEASE_README.md", "start_analyst.bat"}
-    included = {path.relative_to(ROOT).as_posix() for path in release_files}
+    included = {
+        "README.md" if path == readme else path.relative_to(ROOT).as_posix()
+        for path in release_files
+    }
     missing = required - included
     if missing:
         raise RuntimeError(f"Required release files missing: {', '.join(sorted(missing))}")
     with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
         for path in release_files:
-            relative = path.relative_to(ROOT).as_posix()
+            relative = (
+                "README.md"
+                if path == readme
+                else path.relative_to(ROOT).as_posix()
+            )
             archive.write(path, f"{root_folder}/{relative}")
     return archive_path
 
